@@ -1,0 +1,271 @@
+---
+title: "Modeling How Well Users Perform the Bicep Curl Exercise"
+author: "TI"
+date: "2022-06-10"
+output: html_document
+---
+
+# Introduction
+
+This report will attempt to model, and predict, how well a person will perform a bicep curl. The data set used is provided by <http://groupware.les.inf.puc-rio.br/har>, and contains accelerometer data from the belt, forearm, arm, and dumbbell of 6 study participants. The participants were asked to perform barbell lifts correctly and incorrectly in 5 different ways. This report will explore the data, select covariates to use within a model, and train multiple models to find the best model fit.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Class A = Exactly according to specifications Class B = Throwing the elbows to the front Class C = Lifting the dumbbell only halfway Class D = Lowering the dumbbell only halfway Class E = Throwing the hips to the front
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+library(caret)
+library(ggplot2)
+library(ggcorrplot)
+library(car)
+library(Hmisc)
+
+set.seed(1234)
+```
+
+# The Data
+
+The data set is provided by: <http://groupware.les.inf.puc-rio.br/har> and is provided pre-split to a training and testing set. The testing set is not downloaded or used as it will only be used as part of the Coursera course's quiz.
+
+```{r, message=FALSE, warning=FALSE}
+
+link_to_training <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+training <- read_csv(link_to_training)
+```
+
+The data sets contains 19,622 observations with 160 variables. The *classe* variable will be the prediction variable. There are 5 different classes, and therefore a multiclass classification model will need to be created. The classes are as follows:
+
+-   Class A = Exactly according to specifications
+
+-   Class B = Throwing the elbows to the front
+
+-   Class C = Lifting the dumbbell only halfway
+
+-   Class D = Lowering the dumbbell only halfway
+
+-   Class E = Throwing the hips to the front
+
+```{r}
+ggplot(data = training, aes(x = classe)) + geom_histogram(stat="count")
+
+```
+
+## Covariate Selection
+
+### Level One
+
+One hundred of the variables have significant amounts of missing data (97% or greater of the rows having missing data). These columns will not be used. The remaining columns have no missing data and will be carried forward.
+
+There are seven variables that will be removed the training data set as they are not significant to a person performing an exercise. Further reasoning is provided in the following table.
+
+| Covariate            | Reasoning                                                                                                       |
+|---------------------------|---------------------------------------------|
+| ...1                 | This was the index of the data set                                                                              |
+| user_name            | In order to generalize the model better, the specific person performing the exercise should not be in the model |
+| raw_timestamp_part_1 | The data is not bound by time                                                                                   |
+| raw_timestamp_part_2 | The data is not bound by time                                                                                   |
+| cvtd_timestamp       | The data is not bound by time                                                                                   |
+| new_window           | I was not able to find information on what this represents, and will be removed from the model for this reason  |
+| num_window           | I was not able to find information on what this represents, and will be removed from the model for this reason  |
+
+: Table 1. Covariate's that are not significant to a person performing the dumbbell exercise
+
+```{r}
+columns_with_na_count <- sapply(training, function(x) sum(is.na(x)))
+columns_with_no_missing_data <- names(columns_with_na_count[columns_with_na_count == 0])
+columns_not_significant <- c(
+    "...1", "user_name", "raw_timestamp_part_1", 
+    "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window"
+)
+
+trainingTidy <- training %>% 
+    select(any_of(columns_with_no_missing_data)) %>% 
+    select(!all_of(columns_not_significant)) %>% 
+    transform(classe = factor(classe))
+
+in_training <- createDataPartition(trainingTidy$classe, p=0.6, list = F)
+training_split <- trainingTidy[in_training,]
+validation <- trainingTidy[-in_training,]
+
+training_y <- training_split$classe
+training_X <- training_split %>% select(!matches("classe"))
+```
+
+A validation set is created with 40% of the testing data. This will be used to help select a final model.
+
+### Level Two
+
+The next step in the covariate selection will be to standardize. This will improve the model performance. An the non-standardized data is shown below to illustrate the range of values present in the dataset.
+
+```{r}
+hist.data.frame(training_X)
+```
+
+```{r}
+# Center and Scaled
+standardized_X <- preProcess(training_X)
+training_X_sc <- predict(standardized_X, newdata = training_X)
+```
+
+We will now look at correlations within the data set to see if any covariates are strongly correlated. If they are, Principle Component Analysis will be used to de-correlate and reduce the data sets dimensions.
+
+```{r}
+corr <- abs(cor(training_X_sc))
+ggcorrplot(corr)
+```
+
+As shown in the figure, there are quite a few highly correlated covariates. This is concerning as the model may not fit well to out of sample data if these correlations remain.
+
+The following code will remove the correlations using Principle Component Analysis (PCA). The default settings will be used with `prcomp` as it will select the optimal number of components based on the input. Only variables with a correlation of greater then or equal to 0.8 will be included in the PCA.
+
+```{r}
+diag(corr) <- 0
+highly_corr_columns <- rownames(which(corr >= 0.8, arr.ind = T))
+highly_corr_data <- training_X_sc %>% select(all_of(highly_corr_columns))
+
+pca_processed_X <- prcomp(highly_corr_data)
+training_X_pca <- training_X_sc %>% 
+    select(!matches(highly_corr_columns)) %>% 
+    mutate(pca = pca_processed_X$x)
+
+training_X_fin <- training_X_pca
+```
+
+## Transformation Pipeline
+
+The following is a transformation pipeline to be used with the test set. It includes all the transformations used above.
+
+```{r, echo=TRUE}
+
+transform.pipeline <- function(x) {
+    columns_with_no_missing_data <- append(columns_with_no_missing_data, "problem_id")
+    x_out <- x %>%
+        select(any_of(columns_with_no_missing_data)) %>% 
+        select(!any_of(columns_not_significant)) %>% 
+        select(!matches("classe")) %>%
+        select(!matches("problem_id"))  ## This variable is in the test set, needs to be removed while performing the test
+    
+    x_out <- predict(standardized_X, newdata = x_out)
+    
+    x_pca_in <- x_out %>% select(all_of(highly_corr_columns))
+    x_pca_out <- predict(pca_processed_X, x_pca_in)
+    
+    x_out <- x_out %>% 
+        select(!matches(highly_corr_columns)) %>%
+        mutate(pca = x_pca_out)
+    
+    x_out
+}
+```
+
+# Model Selection
+
+Three models will be trained in attempt to find the best fitting model. The models will then be used to predict against the validation data set to see how well they will perform on out of sample data. The library `doParallel` will be loaded to utilized multiple cores on the computer to improve training speeds.
+
+### Cross Validation
+
+Cross validation will be utilized to further tune the model training. The same controls will be used on all model training. As well another `dataframe` of the transformed data is created with `cbind` so it can be used within the training function.
+
+```{r}
+library(doParallel)
+
+fit_control <- trainControl(
+    method="cv",
+    classProbs = TRUE,
+    summaryFunction = multiClassSummary
+)
+training_in <- cbind(classe = training_y, training_X_fin)
+valid_transform <- transform.pipeline(validation)
+```
+
+## K-Nearest Neighbor
+
+```{r, cache=TRUE}
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+
+mdl_knn <- train(
+    classe ~ .,
+    method = "knn",
+    data=training_in,
+    trControl = fit_control
+)
+
+stopCluster(cl)
+mdl_knn
+```
+
+### Validation
+
+```{r}
+predict_knn <- predict(mdl_knn, valid_transform)
+confusionMatrix(predict_knn, validation$classe)
+```
+
+## Random Forest
+
+```{r, warning=FALSE, cache=TRUE}
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+
+mdl_rf <- train(
+    classe ~ .,
+    method = "rf",
+    data=training_in,
+    trControl = fit_control
+)
+stopCluster(cl)
+mdl_rf
+```
+
+### Validation
+
+```{r}
+predict_rf <- predict(mdl_rf, valid_transform)
+confusionMatrix(predict_rf, validation$classe)
+```
+
+## Gradient Descent
+
+*The training grid was created using results from previous training attempts.*
+
+```{r, warning=FALSE, cache=TRUE}
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+
+gbm_grid <- expand.grid(
+    n.trees = c(450, 500, 550), 
+    interaction.depth = c(8, 10, 12), 
+    shrinkage = 0.1,
+    n.minobsinnode = 1
+)
+
+mdl_gbm <- train(
+    classe ~.,
+    method = "gbm",
+    data = training_in,
+    trControl = fit_control,
+    tuneGrid = gbm_grid,
+    verbose = FALSE,
+)
+stopCluster(cl)
+
+mdl_gbm
+```
+
+### Validation
+
+```{r}
+predict_gbm <- predict(mdl_gbm, valid_transform)
+confusionMatrix(predict_gbm, validation$classe)
+```
+
+# Final Model
+
+The best fitting model is **Stochastic Gradient Descent**. It achieved an accuracy in training of 98% and a accuracy of 98.61% CI 98.33% - 98.86% on the validation set. While the Random Forest model had a comparative score, the Gradient Descent model was slightly better overall.
+
+I expected the model to perform similar to the validation performance when provided new out of sample data.
